@@ -1,5 +1,5 @@
 
-# Sakura
+# tty-leaf
 A terminal cherry blossom animation.
 
 

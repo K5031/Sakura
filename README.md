@@ -1,5 +1,5 @@
 
-# tty-leaf
+# Sakura
 A terminal cherry blossom animation.
 
 
@@ -34,9 +34,3 @@ Examples:
 ## License
 
 [MIT](https://choosealicense.com/licenses/mit/)
-
-
-## Authors
-
-- Claude
-- randomarchuser

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import random
 import shutil
 import signal
@@ -34,7 +35,8 @@ def parse_rgb(value, label):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="A terminal cherry blossom animation."
+        description="A terminal cherry blossom animation.",
+        add_help=True,
     )
 
     parser.add_argument(
@@ -56,7 +58,7 @@ def build_parser():
     parser.add_argument(
         "-p",
         "--petal-color",
-        type=lambda value: parse_rgb(value, "petal color"),
+        type=lambda v: parse_rgb(v, "petal color"),
         default=[255, 105, 180],
         metavar="R,G,B",
         help="Petal RGB color (default: 255,105,180 pink)",
@@ -65,10 +67,10 @@ def build_parser():
     parser.add_argument(
         "-b",
         "--bg-color",
-        type=lambda value: parse_rgb(value, "background color"),
+        type=lambda v: parse_rgb(v, "background color"),
         default=None,
         metavar="R,G,B",
-        help="Background RGB color (default: 55,58,59)",
+        help="Background RGB color (optional)",
     )
 
     parser.add_argument(
@@ -108,31 +110,42 @@ class SakuraAnimator:
         self.delay = max(0.0, delay)
 
         self.petal_color = petal_color
-        self.bg_color = bg_color if bg_color is not None else [55, 58, 59]
+        self.bg_color = (
+            bg_color if bg_color is not None else [55, 58, 59]
+        )
 
         self.fixed_drift = fixed_drift
         self.wind_factor = max(0, wind_factor)
 
-        # shutil.get_terminal_size() returns (columns, lines).
         self.cols, self.rows = shutil.get_terminal_size(
             fallback=(80, 24)
         )
 
         self.max_off_screen_y = 20
-        self.max_off_screen_x = self.rows + self.max_off_screen_y
+        self.max_off_screen_x = (
+            self.rows + self.max_off_screen_y
+        )
 
         self.leaf_x = []
         self.leaf_y = []
         self.prev_x = []
         self.prev_y = []
 
+        self.leaf_char = []
+        self.char_timer = []
+        self.char_interval = []
+
         self.reset_positions()
 
     def reset_positions(self):
-        self.leaf_x.clear()
-        self.leaf_y.clear()
-        self.prev_x.clear()
-        self.prev_y.clear()
+        self.leaf_x = []
+        self.leaf_y = []
+        self.prev_x = []
+        self.prev_y = []
+
+        self.leaf_char = []
+        self.char_timer = []
+        self.char_interval = []
 
         for _ in range(self.num_leaves):
             x = random.randint(
@@ -147,105 +160,180 @@ class SakuraAnimator:
 
             self.leaf_x.append(x)
             self.leaf_y.append(y)
+
             self.prev_x.append(x)
             self.prev_y.append(y)
 
-    def cleanup(self):
-        # Reset colors and show cursor.
-        sys.stdout.write("\033[0m")
-        sys.stdout.write("\033[?25h")
+            self.leaf_char.append(
+                random.choice(PETAL_CHARS)
+            )
 
-        # Clear screen and return cursor home.
-        sys.stdout.write("\033[2J")
-        sys.stdout.write("\033[H")
+            self.char_timer.append(0)
+
+            self.char_interval.append(
+                random.randint(3, 8)
+            )
+
+    def cleanup(self):
+        sys.stdout.write(
+            "\033[?25h"
+            "\033[0m"
+            "\033[2J"
+            "\033[H"
+        )
 
         sys.stdout.flush()
+        raise SystemExit(0)
 
     def draw_background(self):
-        bg_code = ansi_rgb("48", self.bg_color)
+        bg = ansi_rgb("48", self.bg_color)
 
         sys.stdout.write("\033[H")
-        sys.stdout.write(bg_code)
 
-        for row in range(1, self.rows + 1):
+        for row in range(self.rows):
             sys.stdout.write(
-                f"\033[{row};1H{' ' * self.cols}"
+                f"\033[{row + 1};1H"
+                f"{bg}"
+                f"{' ' * self.cols}"
             )
 
         sys.stdout.flush()
 
-    def respawn_leaf(self, i):
-        self.leaf_y[i] = random.randint(
-            -self.max_off_screen_y,
-            -1,
-        )
-
-        self.leaf_x[i] = random.randint(
-            -self.max_off_screen_x,
-            self.cols + self.max_off_screen_x - 1,
-        )
-
-        # Invalid previous position so nothing gets erased.
-        self.prev_y[i] = 0
-        self.prev_x[i] = 0
-
     def run(self):
         self.draw_background()
 
-        petal_code = ansi_rgb("38", self.petal_color)
-        bg_code = ansi_rgb("48", self.bg_color)
+        petal_code = ansi_rgb(
+            "38",
+            self.petal_color,
+        )
+
+        bg_code = ansi_rgb(
+            "48",
+            self.bg_color,
+        )
 
         while True:
+            sys.stdout.write("\033[H")
+
             for i in range(self.num_leaves):
                 prev_y = self.prev_y[i]
                 prev_x = self.prev_x[i]
 
-                # Erase previous petal.
                 if (
                     1 <= prev_y <= self.rows
                     and 1 <= prev_x <= self.cols
                 ):
                     sys.stdout.write(
-                        f"\033[{prev_y};{prev_x}H{bg_code} "
+                        f"\033[{prev_y};{prev_x}H"
+                        f"{bg_code} "
                     )
 
-                # Store current position.
-                if self.leaf_y[i] < self.rows:
-                    self.prev_x[i] = self.leaf_x[i]
-                    self.prev_y[i] = self.leaf_y[i]
+                self.prev_x[i] = 0
+                self.prev_y[i] = 0
 
-                # Fall downward.
                 self.leaf_y[i] += 1
 
-                # Apply wind / drift.
                 wobble = random.randint(
                     -self.wind_factor,
                     self.wind_factor,
                 )
 
-                drift = self.fixed_drift + wobble
+                drift = (
+                    self.fixed_drift
+                    + wobble
+                )
+
                 self.leaf_x[i] += drift
 
-                # Draw petal if visible.
+                # Change petal symbol only every few frames.
+                self.char_timer[i] += 1
+
+                if self.char_timer[i] >= self.char_interval[i]:
+                    self.leaf_char[i] = random.choice(
+                        PETAL_CHARS
+                    )
+
+                    self.char_timer[i] = 0
+
+                    self.char_interval[i] = random.randint(
+                        3,
+                        8,
+                    )
+
                 if (
                     1 <= self.leaf_y[i] <= self.rows
                     and 1 <= self.leaf_x[i] <= self.cols
                 ):
-                    petal = random.choice(PETAL_CHARS)
+                    petal = self.leaf_char[i]
 
                     sys.stdout.write(
                         f"\033[{self.leaf_y[i]};"
                         f"{self.leaf_x[i]}H"
-                        f"{petal_code}{petal}{bg_code}"
+                        f"{petal_code}"
+                        f"{petal}"
+                        f"{bg_code}"
                     )
 
-                # Respawn after reaching bottom.
-                if self.leaf_y[i] > self.rows:
-                    self.respawn_leaf(i)
+                    if self.leaf_y[i] < self.rows:
+                        self.prev_x[i] = (
+                            self.leaf_x[i]
+                        )
 
-                # Respawn after drifting off right edge.
+                        self.prev_y[i] = (
+                            self.leaf_y[i]
+                        )
+
+                if self.leaf_y[i] > self.rows:
+                    self.leaf_y[i] = random.randint(
+                        -self.max_off_screen_y,
+                        -1,
+                    )
+
+                    self.leaf_x[i] = random.randint(
+                        -self.max_off_screen_x,
+                        self.cols
+                        + self.max_off_screen_x
+                        - 1,
+                    )
+
+                    self.prev_x[i] = 0
+                    self.prev_y[i] = 0
+
+                    self.leaf_char[i] = random.choice(
+                        PETAL_CHARS
+                    )
+
+                    self.char_timer[i] = 0
+                    self.char_interval[i] = random.randint(
+                        3,
+                        8,
+                    )
+
                 elif self.leaf_x[i] > self.cols:
-                    self.respawn_leaf(i)
+                    self.leaf_y[i] = random.randint(
+                        -self.max_off_screen_y,
+                        -1,
+                    )
+
+                    self.leaf_x[i] = random.randint(
+                        -self.max_off_screen_x,
+                        self.cols
+                        + self.max_off_screen_x
+                        - 1,
+                    )
+
+                    self.prev_x[i] = 0
+                    self.prev_y[i] = 0
+
+                    self.leaf_char[i] = random.choice(
+                        PETAL_CHARS
+                    )
+
+                    self.char_timer[i] = 0
+                    self.char_interval[i] = random.randint(
+                        3,
+                        8,
+                    )
 
             sys.stdout.flush()
             time.sleep(self.delay)
@@ -254,6 +342,9 @@ class SakuraAnimator:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
 
     animator = SakuraAnimator(
         num_leaves=args.num_leaves,
@@ -266,22 +357,24 @@ def main():
 
     def handle_signal(signum, frame):
         animator.cleanup()
-        raise SystemExit(0)
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(
+        signal.SIGINT,
+        handle_signal,
+    )
 
-    # Hide cursor.
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
+    signal.signal(
+        signal.SIGTERM,
+        handle_signal,
+    )
 
     try:
         animator.run()
 
-    except KeyboardInterrupt:
-        pass
+    except SystemExit:
+        raise
 
-    finally:
+    except KeyboardInterrupt:
         animator.cleanup()
 
 

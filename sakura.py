@@ -3,13 +3,32 @@
 import argparse
 import os
 import random
+import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 
 
 PETAL_CHARS = ["*", "•", "o", ".", "❀", "✿"]
+
+DEFAULT_PETAL_COLOR = [255, 105, 180]
+
+PETAL_COLORS = [
+    [255, 172, 212],  # #FFACD4
+    [255, 141, 196],  # #FF8DC4
+    [246, 123, 182],  # #F67BB6
+    [241,  99, 168],  # #F163A8
+    [237,  77, 154],  # #ED4D9A
+]
+
+TREE_SPAWN_PROBABILITY = 0.85
+
+ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+TRUECOLOR_FG_RE = re.compile(
+    r"\x1b\[38;2;(\d+);(\d+);(\d+)m"
+)
 
 
 def parse_rgb(value, label):
@@ -33,40 +52,67 @@ def parse_rgb(value, label):
     return parts
 
 
+def parse_tree_scale(value):
+    try:
+        scale = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "tree scale must be a number between 0 and 1"
+        ) from exc
+
+    if not 0 < scale <= 1:
+        raise argparse.ArgumentTypeError(
+            "tree scale must be greater than 0 and at most 1"
+        )
+
+    return scale
+
+
+def lighten_ansi_color(style, amount=60):
+    match = TRUECOLOR_FG_RE.search(style)
+
+    if not match:
+        return style
+
+    r, g, b = map(int, match.groups())
+
+    return (
+        f"\033[38;2;"
+        f"{min(255, r + amount)};"
+        f"{min(255, g + amount)};"
+        f"{min(255, b + amount)}m"
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="A terminal cherry blossom animation.",
-        add_help=True,
+        description="A terminal cherry blossom animation."
     )
 
     parser.add_argument(
-        "-n",
-        "--num-leaves",
+        "-n", "--num-leaves",
         type=int,
         default=30,
         help="Number of falling leaves (default: 30)",
     )
 
     parser.add_argument(
-        "-d",
-        "--delay",
+        "-d", "--delay",
         type=float,
         default=0.08,
         help="Animation delay in seconds (default: 0.08)",
     )
 
     parser.add_argument(
-        "-p",
-        "--petal-color",
+        "-p", "--petal-color",
         type=lambda v: parse_rgb(v, "petal color"),
-        default=[255, 105, 180],
+        default=DEFAULT_PETAL_COLOR,
         metavar="R,G,B",
-        help="Petal RGB color (default: 255,105,180 pink)",
+        help="Override random pink shades with one RGB color",
     )
 
     parser.add_argument(
-        "-b",
-        "--bg-color",
+        "-b", "--bg-color",
         type=lambda v: parse_rgb(v, "background color"),
         default=None,
         metavar="R,G,B",
@@ -74,19 +120,31 @@ def build_parser():
     )
 
     parser.add_argument(
-        "-D",
-        "--drift",
+        "-D", "--drift",
         type=int,
         default=1,
         help="Fixed drift per frame (default: 1)",
     )
 
     parser.add_argument(
-        "-w",
-        "--wind-factor",
+        "-w", "--wind-factor",
         type=int,
         default=1,
         help="Wind random wobble factor (default: 1)",
+    )
+
+    parser.add_argument(
+        "-t", "--tree",
+        action="store_true",
+        help="Display sakura.png as ASCII art on the left",
+    )
+
+    parser.add_argument(
+        "--tree-scale",
+        type=parse_tree_scale,
+        default=0.6,
+        metavar="SCALE",
+        help="Tree height as a fraction of terminal height (default: 0.6)",
     )
 
     return parser
@@ -105,26 +163,35 @@ class SakuraAnimator:
         bg_color,
         fixed_drift,
         wind_factor,
+        show_tree,
+        tree_scale,
     ):
         self.num_leaves = max(1, num_leaves)
         self.delay = max(0.0, delay)
-
         self.petal_color = petal_color
-        self.bg_color = (
-            bg_color if bg_color is not None else [55, 58, 59]
-        )
-
+        self.use_pink_palette = petal_color == DEFAULT_PETAL_COLOR
+        self.bg_color = bg_color if bg_color is not None else [55, 58, 59]
         self.fixed_drift = fixed_drift
         self.wind_factor = max(0, wind_factor)
 
-        self.cols, self.rows = shutil.get_terminal_size(
-            fallback=(80, 24)
-        )
+        self.cols, self.rows = shutil.get_terminal_size(fallback=(80, 24))
 
         self.max_off_screen_y = 20
-        self.max_off_screen_x = (
-            self.rows + self.max_off_screen_y
-        )
+        self.max_off_screen_x = self.rows + self.max_off_screen_y
+
+        self.show_tree = show_tree
+        self.tree_scale = tree_scale
+
+        self.tree_cells = {}
+        self.canopy_spawn_points = []
+
+        self.tree_height = 0
+        self.tree_width = 0
+        self.tree_top = 1
+        self.ground_row = self.rows
+
+        # (row, col) -> (character, RGB)
+        self.ground_pile = {}
 
         self.leaf_x = []
         self.leaf_y = []
@@ -132,10 +199,297 @@ class SakuraAnimator:
         self.prev_y = []
 
         self.leaf_char = []
+        self.leaf_color = []
         self.char_timer = []
         self.char_interval = []
+        self.leaf_rest_row = []
+
+        if self.show_tree:
+            self.load_tree()
 
         self.reset_positions()
+
+    def random_petal_color(self):
+        if self.use_pink_palette:
+            return random.choice(PETAL_COLORS).copy()
+
+        return self.petal_color.copy()
+
+    # --------------------------------------------------------
+    # Tree
+    # --------------------------------------------------------
+
+    def load_tree(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        image_path = os.path.join(script_dir, "sakura.png")
+
+        if not os.path.isfile(image_path):
+            raise SystemExit(f"Tree image not found: {image_path}")
+
+        if shutil.which("ascii-image-converter") is None:
+            raise SystemExit(
+                "ascii-image-converter was not found in PATH.\n"
+                "Install it before using --tree."
+            )
+
+        self.tree_height = max(1, int(self.rows * self.tree_scale))
+        self.tree_width = min(self.cols, round(self.tree_height * 2.5))
+        self.tree_top = 1
+        self.ground_row = min(self.rows, self.tree_height + 1)
+
+        try:
+            result = subprocess.run(
+                [
+                    "ascii-image-converter",
+                    image_path,
+                    "-C",
+                    "-d",
+                    f"{self.tree_width},{self.tree_height}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            error = exc.stderr.strip() or "unknown converter error"
+            raise SystemExit(
+                f"ascii-image-converter failed: {error}"
+            ) from exc
+
+        self.parse_tree_output(result.stdout.splitlines())
+        self.remove_small_tree_components()
+        self.build_canopy_spawn_points()
+
+    def parse_tree_output(self, lines):
+        self.tree_cells = {}
+
+        for local_row, line in enumerate(lines):
+            actual_row = self.tree_top + local_row
+
+            if actual_row > self.rows:
+                break
+
+            col = 1
+            pos = 0
+            active_style = ""
+
+            while pos < len(line):
+                match = ANSI_SGR_RE.match(line, pos)
+
+                if match:
+                    sequence = match.group(0)
+
+                    active_style = (
+                        ""
+                        if sequence in ("\033[0m", "\033[m")
+                        else sequence
+                    )
+
+                    pos = match.end()
+                    continue
+
+                char = line[pos]
+                pos += 1
+
+                if col > self.cols:
+                    break
+
+                if char != " ":
+                    style = active_style
+
+                    if char in ".:;":
+                        style = lighten_ansi_color(
+                            style,
+                            amount=60,
+                        )
+
+                    self.tree_cells[(actual_row, col)] = style + char
+
+                col += 1
+
+    def remove_small_tree_components(self, minimum_size=18):
+        positions = set(self.tree_cells)
+
+        if not positions:
+            return
+
+        unvisited = set(positions)
+        components = []
+
+        while unvisited:
+            start = unvisited.pop()
+            component = {start}
+            stack = [start]
+
+            while stack:
+                row, col = stack.pop()
+
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+
+                        neighbor = (row + dy, col + dx)
+
+                        if neighbor in unvisited:
+                            unvisited.remove(neighbor)
+                            component.add(neighbor)
+                            stack.append(neighbor)
+
+            components.append(component)
+
+        largest = max(components, key=len)
+        keep = set(largest)
+
+        for component in components:
+            if component is not largest and len(component) >= minimum_size:
+                keep.update(component)
+
+        self.tree_cells = {
+            position: value
+            for position, value in self.tree_cells.items()
+            if position in keep
+        }
+
+    def build_canopy_spawn_points(self):
+        self.canopy_spawn_points = []
+
+        if not self.tree_cells:
+            return
+
+        direction = 1 if self.fixed_drift >= 0 else -1
+        positions = set(self.tree_cells)
+
+        for row, col in positions:
+            outside_col = col + direction
+
+            if not 1 <= outside_col <= self.cols:
+                continue
+
+            if (row, outside_col) not in positions:
+                self.canopy_spawn_points.append(
+                    (row, outside_col)
+                )
+
+    def tree_at(self, row, col):
+        return self.tree_cells.get((row, col))
+
+    def draw_tree(self):
+        if not self.show_tree:
+            return
+
+        bg_code = ansi_rgb("48", self.bg_color)
+
+        for (row, col), char in self.tree_cells.items():
+            sys.stdout.write(
+                f"\033[{row};{col}H"
+                f"{char}"
+                f"{bg_code}"
+            )
+
+    # --------------------------------------------------------
+    # Ground
+    # --------------------------------------------------------
+
+    def draw_ground(self):
+        if not self.show_tree:
+            return
+
+        bg_code = ansi_rgb("48", self.bg_color)
+        ground_color = ansi_rgb("38", [125, 108, 92])
+
+        sys.stdout.write(
+            f"\033[{self.ground_row};1H"
+            f"{ground_color}"
+            f"{'_' * self.cols}"
+            f"{bg_code}"
+        )
+
+    def choose_rest_row(self):
+        return random.randint(
+            self.ground_row,
+            self.rows,
+        )
+
+    def draw_ground_pile(self):
+        if not self.show_tree:
+            return
+
+        bg_code = ansi_rgb("48", self.bg_color)
+
+        for (row, col), (petal, color) in self.ground_pile.items():
+            if (
+                self.ground_row <= row <= self.rows
+                and 1 <= col <= self.cols
+            ):
+                sys.stdout.write(
+                    f"\033[{row};{col}H"
+                    f"{ansi_rgb('38', color)}"
+                    f"{petal}"
+                    f"{bg_code}"
+                )
+
+    # --------------------------------------------------------
+    # Petals
+    # --------------------------------------------------------
+
+    def spawn_leaf(self, i):
+        spawn_from_tree = (
+            self.show_tree
+            and self.canopy_spawn_points
+            and random.random() < TREE_SPAWN_PROBABILITY
+        )
+
+        if spawn_from_tree:
+            row, col = random.choice(
+                self.canopy_spawn_points
+            )
+
+            row += random.randint(-1, 1)
+
+            row = max(
+                1,
+                min(
+                    row,
+                    self.ground_row - 1,
+                ),
+            )
+
+            self.leaf_y[i] = row
+            self.leaf_x[i] = col
+
+        else:
+            self.leaf_y[i] = random.randint(
+                -self.max_off_screen_y,
+                -1,
+            )
+
+            if self.show_tree:
+                self.leaf_x[i] = random.randint(
+                    1,
+                    self.cols,
+                )
+            else:
+                self.leaf_x[i] = random.randint(
+                    -self.max_off_screen_x,
+                    self.cols + self.max_off_screen_x - 1,
+                )
+
+        self.prev_x[i] = 0
+        self.prev_y[i] = 0
+
+        self.leaf_char[i] = random.choice(PETAL_CHARS)
+        self.leaf_color[i] = self.random_petal_color()
+
+        self.char_timer[i] = 0
+        self.char_interval[i] = random.randint(3, 8)
+
+        self.leaf_rest_row[i] = (
+            self.choose_rest_row()
+            if self.show_tree
+            else self.rows
+        )
 
     def reset_positions(self):
         self.leaf_x = []
@@ -144,8 +498,10 @@ class SakuraAnimator:
         self.prev_y = []
 
         self.leaf_char = []
+        self.leaf_color = []
         self.char_timer = []
         self.char_interval = []
+        self.leaf_rest_row = []
 
         for _ in range(self.num_leaves):
             x = random.randint(
@@ -153,9 +509,15 @@ class SakuraAnimator:
                 self.cols + self.max_off_screen_x - 1,
             )
 
+            max_y = (
+                self.ground_row - 1
+                if self.show_tree
+                else self.rows + self.max_off_screen_y - 1
+            )
+
             y = random.randint(
                 -self.max_off_screen_y,
-                self.rows + self.max_off_screen_y - 1,
+                max_y,
             )
 
             self.leaf_x.append(x)
@@ -168,11 +530,27 @@ class SakuraAnimator:
                 random.choice(PETAL_CHARS)
             )
 
-            self.char_timer.append(0)
+            self.leaf_color.append(
+                self.random_petal_color()
+            )
 
+            self.char_timer.append(0)
             self.char_interval.append(
                 random.randint(3, 8)
             )
+
+            self.leaf_rest_row.append(
+                self.choose_rest_row()
+                if self.show_tree
+                else self.rows
+            )
+
+    def respawn_leaf(self, i):
+        self.spawn_leaf(i)
+
+    # --------------------------------------------------------
+    # Terminal
+    # --------------------------------------------------------
 
     def cleanup(self):
         sys.stdout.write(
@@ -188,8 +566,6 @@ class SakuraAnimator:
     def draw_background(self):
         bg = ansi_rgb("48", self.bg_color)
 
-        sys.stdout.write("\033[H")
-
         for row in range(self.rows):
             sys.stdout.write(
                 f"\033[{row + 1};1H"
@@ -199,38 +575,53 @@ class SakuraAnimator:
 
         sys.stdout.flush()
 
+    # --------------------------------------------------------
+    # Animation
+    # --------------------------------------------------------
+
     def run(self):
         self.draw_background()
 
-        petal_code = ansi_rgb(
-            "38",
-            self.petal_color,
-        )
+        bg_code = ansi_rgb("48", self.bg_color)
 
-        bg_code = ansi_rgb(
-            "48",
-            self.bg_color,
-        )
+        if self.show_tree:
+            self.draw_ground()
+            self.draw_ground_pile()
+            self.draw_tree()
+
+        sys.stdout.flush()
 
         while True:
-            sys.stdout.write("\033[H")
-
             for i in range(self.num_leaves):
                 prev_y = self.prev_y[i]
                 prev_x = self.prev_x[i]
 
+                # Erase previous position.
                 if (
                     1 <= prev_y <= self.rows
                     and 1 <= prev_x <= self.cols
                 ):
-                    sys.stdout.write(
-                        f"\033[{prev_y};{prev_x}H"
-                        f"{bg_code} "
+                    tree_char = self.tree_at(
+                        prev_y,
+                        prev_x,
                     )
+
+                    if tree_char is not None:
+                        sys.stdout.write(
+                            f"\033[{prev_y};{prev_x}H"
+                            f"{tree_char}"
+                            f"{bg_code}"
+                        )
+                    else:
+                        sys.stdout.write(
+                            f"\033[{prev_y};{prev_x}H"
+                            f"{bg_code} "
+                        )
 
                 self.prev_x[i] = 0
                 self.prev_y[i] = 0
 
+                # Move.
                 self.leaf_y[i] += 1
 
                 wobble = random.randint(
@@ -238,102 +629,94 @@ class SakuraAnimator:
                     self.wind_factor,
                 )
 
-                drift = (
+                self.leaf_x[i] += (
                     self.fixed_drift
                     + wobble
                 )
 
-                self.leaf_x[i] += drift
-
-                # Change petal symbol only every few frames.
+                # Tumble.
                 self.char_timer[i] += 1
 
-                if self.char_timer[i] >= self.char_interval[i]:
-                    self.leaf_char[i] = random.choice(
-                        PETAL_CHARS
+                if (
+                    self.char_timer[i]
+                    >= self.char_interval[i]
+                ):
+                    self.leaf_char[i] = (
+                        random.choice(
+                            PETAL_CHARS
+                        )
                     )
 
                     self.char_timer[i] = 0
-
-                    self.char_interval[i] = random.randint(
-                        3,
-                        8,
+                    self.char_interval[i] = (
+                        random.randint(3, 8)
                     )
 
+                # Land.
+                if (
+                    self.show_tree
+                    and self.leaf_y[i]
+                    >= self.leaf_rest_row[i]
+                ):
+                    row = self.leaf_rest_row[i]
+                    col = self.leaf_x[i]
+
+                    if 1 <= col <= self.cols:
+                        self.ground_pile[
+                            (row, col)
+                        ] = (
+                            self.leaf_char[i],
+                            self.leaf_color[i],
+                        )
+
+                    self.respawn_leaf(i)
+                    continue
+
+                # Draw.
                 if (
                     1 <= self.leaf_y[i] <= self.rows
                     and 1 <= self.leaf_x[i] <= self.cols
                 ):
-                    petal = self.leaf_char[i]
+                    row = self.leaf_y[i]
+                    col = self.leaf_x[i]
 
-                    sys.stdout.write(
-                        f"\033[{self.leaf_y[i]};"
-                        f"{self.leaf_x[i]}H"
-                        f"{petal_code}"
-                        f"{petal}"
-                        f"{bg_code}"
-                    )
-
-                    if self.leaf_y[i] < self.rows:
-                        self.prev_x[i] = (
-                            self.leaf_x[i]
+                    if self.tree_at(row, col) is None:
+                        sys.stdout.write(
+                            f"\033[{row};{col}H"
+                            f"{ansi_rgb('38', self.leaf_color[i])}"
+                            f"{self.leaf_char[i]}"
+                            f"{bg_code}"
                         )
 
-                        self.prev_y[i] = (
-                            self.leaf_y[i]
-                        )
+                        if (
+                            not self.show_tree
+                            and row == self.rows
+                        ):
+                            pass
+                        else:
+                            self.prev_x[i] = col
+                            self.prev_y[i] = row
 
-                if self.leaf_y[i] > self.rows:
-                    self.leaf_y[i] = random.randint(
-                        -self.max_off_screen_y,
-                        -1,
-                    )
-
-                    self.leaf_x[i] = random.randint(
-                        -self.max_off_screen_x,
-                        self.cols
-                        + self.max_off_screen_x
-                        - 1,
-                    )
-
-                    self.prev_x[i] = 0
-                    self.prev_y[i] = 0
-
-                    self.leaf_char[i] = random.choice(
-                        PETAL_CHARS
-                    )
-
-                    self.char_timer[i] = 0
-                    self.char_interval[i] = random.randint(
-                        3,
-                        8,
-                    )
+                # Respawn when leaving the scene.
+                if (
+                    not self.show_tree
+                    and self.leaf_y[i] > self.rows
+                ):
+                    self.respawn_leaf(i)
 
                 elif self.leaf_x[i] > self.cols:
-                    self.leaf_y[i] = random.randint(
-                        -self.max_off_screen_y,
-                        -1,
-                    )
+                    self.respawn_leaf(i)
 
-                    self.leaf_x[i] = random.randint(
-                        -self.max_off_screen_x,
-                        self.cols
-                        + self.max_off_screen_x
-                        - 1,
-                    )
+                elif (
+                    self.leaf_x[i]
+                    < -self.max_off_screen_x
+                ):
+                    self.respawn_leaf(i)
 
-                    self.prev_x[i] = 0
-                    self.prev_y[i] = 0
-
-                    self.leaf_char[i] = random.choice(
-                        PETAL_CHARS
-                    )
-
-                    self.char_timer[i] = 0
-                    self.char_interval[i] = random.randint(
-                        3,
-                        8,
-                    )
+            if self.show_tree:
+                self.draw_ground()
+                self.draw_ground_pile()
+                self.draw_tree()
 
             sys.stdout.flush()
             time.sleep(self.delay)
@@ -353,27 +736,20 @@ def main():
         bg_color=args.bg_color,
         fixed_drift=args.drift,
         wind_factor=args.wind_factor,
+        show_tree=args.tree,
+        tree_scale=args.tree_scale,
     )
 
     def handle_signal(signum, frame):
         animator.cleanup()
 
-    signal.signal(
-        signal.SIGINT,
-        handle_signal,
-    )
-
-    signal.signal(
-        signal.SIGTERM,
-        handle_signal,
-    )
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         animator.run()
-
     except SystemExit:
         raise
-
     except KeyboardInterrupt:
         animator.cleanup()
 

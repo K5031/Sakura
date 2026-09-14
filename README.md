@@ -4,8 +4,7 @@ A terminal cherry blossom animation.
 
 
 ## Demo
-
-https://github.com/user-attachments/assets/f23e070a-b299-47f8-82e5-a8e9a56cea87
+https://github.com/user-attachments/assets/7e3f06df-25c3-4b2f-a817-1479f1446447
 
 
 ## Usage/Examples

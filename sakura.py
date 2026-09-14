@@ -278,7 +278,7 @@ class SakuraAnimator:
 
         self.tree_width = min(
             self.cols,
-            round(self.tree_height * 2.5),
+            round(self.tree_height * 2.8),
         )
 
         self.tree_top = 1

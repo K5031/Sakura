@@ -8,9 +8,10 @@ https://github.com/user-attachments/assets/7e3f06df-25c3-4b2f-a817-1479f1446447
 
 
 ## Usage/Examples
+First, install ascii-image-converter: https://github.com/LeandroBarone/python-ascii_magic
 
 ```bash
-./sakura.py [OPTIONS]
+python sakura.py [OPTIONS]
 ```
 
 Options:
@@ -26,8 +27,6 @@ Options:
     --tree-scale SCALE     Tree height relative to terminal height (default: 0.6)
 -h, --help                 Show this help message
 ```
-
-RGB values range from `0-255` for each component.
 
 Examples:
 
